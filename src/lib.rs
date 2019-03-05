@@ -14,8 +14,6 @@
 
 mod endpoint;
 
-mod atomic_mutex;
-
 /// USB peripheral driver.
 pub mod bus;
 

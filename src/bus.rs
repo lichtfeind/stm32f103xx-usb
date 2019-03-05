@@ -1,26 +1,26 @@
-use bare_metal::Mutex;
 use core::cell::RefCell;
 use core::mem;
 use usb_device::{Result, UsbDirection, UsbError};
 use usb_device::bus::{UsbBusAllocator, PollResult};
 use usb_device::endpoint::{EndpointType, EndpointAddress};
-use cortex_m::asm::delay;
+use cortex_m::asm;
 use cortex_m::interrupt;
-use stm32f1xx_hal::prelude::*;
-use stm32f1xx_hal::rcc;
-use stm32f1xx_hal::gpio::{self, gpioa};
-use stm32f1xx_hal::stm32::{USB, RCC};
-use crate::atomic_mutex::AtomicMutex;
+use cortex_m::interrupt::Mutex;
+extern crate stm32f0xx_hal as hal;
+use hal::prelude::*;
+use hal::rcc;
+use hal::gpio::{Pin, Output, PushPull};
+use hal::stm32::{USB, RCC};
 use crate::endpoint::{NUM_ENDPOINTS, Endpoint, EndpointStatus, calculate_count_rx};
 
 struct Reset {
     delay: u32,
-    pin: Mutex<RefCell<gpioa::PA12<gpio::Output<gpio::PushPull>>>>,
+    pin: Mutex<RefCell<Pin<Output<PushPull>>>>,
 }
 
 /// USB peripheral driver for STM32F103 microcontrollers.
 pub struct UsbBus {
-    regs: AtomicMutex<USB>,
+    regs: Mutex<USB>,
     endpoints: [Endpoint; NUM_ENDPOINTS],
     next_ep_mem: usize,
     max_endpoint: usize,
@@ -28,17 +28,18 @@ pub struct UsbBus {
 }
 
 impl UsbBus {
-    fn new(regs: USB, apb1: &mut rcc::APB1, reset: Option<Reset>) -> UsbBusAllocator<Self> {
+    fn new(regs: USB, rcc: &mut rcc::Rcc, reset: Option<Reset>) -> UsbBusAllocator<Self> {
         // TODO: apb1.enr is not public, figure out how this should really interact with the HAL
         // crate
-
-        let _ = apb1;
+        let _ = rcc;
         interrupt::free(|_| {
-            unsafe { (&*RCC::ptr()) }.apb1enr.modify(|_, w| w.usben().set_bit());
+            let rcc = unsafe { (&*RCC::ptr()) };
+            rcc.apb1enr.modify(|_, w| w.usben().set_bit());
+            rcc.cfgr3.modify(|_, w| w.usbsw().clear_bit());
         });
 
         let bus = UsbBus {
-            regs: AtomicMutex::new(regs),
+            regs: Mutex::new(regs),
             next_ep_mem: Endpoint::MEM_START,
             max_endpoint: 0,
             endpoints: unsafe {
@@ -57,24 +58,23 @@ impl UsbBus {
     }
 
     /// Constructs a new USB peripheral driver.
-    pub fn usb(regs: USB, apb1: &mut rcc::APB1) -> UsbBusAllocator<Self> {
+    pub fn usb(regs: USB, apb1: &mut rcc::Rcc) -> UsbBusAllocator<Self> {
         UsbBus::new(regs, apb1, None)
     }
 
     /// Constructs a new USB peripheral driver with the "reset" method enabled.
-    pub fn usb_with_reset<M>(
+    pub fn usb_with_reset(
         regs: USB,
-        apb1: &mut rcc::APB1,
+        apb1: &mut rcc::Rcc,
         clocks: &rcc::Clocks,
-        crh: &mut gpioa::CRH,
-        pa12: gpioa::PA12<M>) -> UsbBusAllocator<Self>
+        reset_pin: Pin<Output<PushPull>>) -> UsbBusAllocator<Self>
     {
         UsbBus::new(
             regs,
             apb1,
             Some(Reset {
                 delay: clocks.sysclk().0,
-                pin: Mutex::new(RefCell::new(pa12.into_push_pull_output(crh))),
+                pin: Mutex::new(RefCell::new(reset_pin)),
             }))
     }
 
@@ -150,15 +150,18 @@ impl usb_device::bus::UsbBus for UsbBus {
         self.max_endpoint = max;
 
         interrupt::free(|cs| {
-            let regs = self.regs.lock(cs);
+            let regs = self.regs.borrow(cs);
 
             regs.cntr.modify(|_, w| w.pdwn().clear_bit());
 
             // There is a chip specific startup delay. For STM32F103xx it's 1µs and this should wait for
             // at least that long.
-            delay(72);
+            //delay(72); // Not supported for cortex m3
+            for _ in 0..(1 << 8) { //FIXME get something that will wait the correct time
+                asm::nop();
+            }
 
-            regs.btable.modify(|_, w| unsafe { w.btable().bits(0) });
+            regs.btable.modify(|_, w| { w.btable().bits(0) });
             regs.cntr.modify(|_, w| w
                 .fres().clear_bit()
                 .resetm().set_bit()
@@ -168,15 +171,16 @@ impl usb_device::bus::UsbBus for UsbBus {
                 .pmaovrm().set_bit()
                 .ctrm().set_bit());
             regs.istr.modify(|_, w| unsafe { w.bits(0) });
+            regs.bcdr.modify(|_, w| w.dppu().set_bit()); // Enable embedded Pull-up
         });
     }
 
     fn reset(&self) {
         interrupt::free(|cs| {
-            let regs = self.regs.lock(cs);
+            let regs = self.regs.borrow(cs);
 
             regs.istr.modify(|_, w| unsafe { w.bits(0) });
-            regs.daddr.modify(|_, w| unsafe { w.ef().set_bit().add().bits(0) });
+            regs.daddr.modify(|_, w| { w.ef().set_bit().add().bits(0) });
 
             for ep in self.endpoints.iter() {
                 ep.configure(cs);
@@ -186,77 +190,72 @@ impl usb_device::bus::UsbBus for UsbBus {
 
     fn set_device_address(&self, addr: u8) {
         interrupt::free(|cs| {
-            self.regs.lock(cs).daddr.modify(|_, w| unsafe { w.add().bits(addr as u8) });
+            self.regs.borrow(cs).daddr.modify(|_, w| { w.add().bits(addr as u8) });
         });
     }
 
     fn poll(&self) -> PollResult {
-        let mut guard = self.regs.try_lock();
+        interrupt::free(|cs| {
+            let regs = self.regs.borrow(cs);
 
-        let regs = match guard {
-            Some(ref mut r) => r,
-            // re-entrant call, any interrupts will be handled by the already-running call or the
-            // next call
-            None => { return PollResult::None; }
-        };
+            let istr = regs.istr.read();
 
-        let istr = regs.istr.read();
+            if istr.wkup().bit_is_set() {
+                regs.istr.modify(|_, w| w.wkup().clear_bit());
 
-        if istr.wkup().bit_is_set() {
-            regs.istr.modify(|_, w| w.wkup().clear_bit());
+                let fnr = regs.fnr.read();
+                //let bits = (fnr.rxdp().bit_is_set() as u8) << 1 | (fnr.rxdm().bit_is_set() as u8);
 
-            let fnr = regs.fnr.read();
-            //let bits = (fnr.rxdp().bit_is_set() as u8) << 1 | (fnr.rxdm().bit_is_set() as u8);
-
-            match (fnr.rxdp().bit_is_set(), fnr.rxdm().bit_is_set()) {
-                (false, false) | (false, true) => {
-                    PollResult::Resume
-                },
-                _ => {
-                    // Spurious wakeup event caused by noise
-                    PollResult::Suspend
-                }
-            }
-        } else if istr.reset().bit_is_set() {
-            regs.istr.modify(|_, w| w.reset().clear_bit());
-
-            PollResult::Reset
-        } else if istr.susp().bit_is_set() {
-            regs.istr.modify(|_, w| w.susp().clear_bit());
-
-            PollResult::Suspend
-        } else if istr.ctr().bit_is_set() {
-            let mut ep_out = 0;
-            let mut ep_in_complete = 0;
-            let mut ep_setup = 0;
-            let mut bit = 1;
-
-            for ep in &self.endpoints[0..=self.max_endpoint] {
-                let v = ep.read_reg();
-
-                if v.ctr_rx().bit_is_set() {
-                    ep_out |= bit;
-
-                    if v.setup().bit_is_set() {
-                        ep_setup |= bit;
+                match (fnr.rxdp().bit_is_set(), fnr.rxdm().bit_is_set()) {
+                    (false, false) | (false, true) => {
+                        PollResult::Resume
+                    },
+                    _ => {
+                        // Spurious wakeup event caused by noise
+                        PollResult::Suspend
                     }
                 }
+            } else if istr.reset().bit_is_set() {
+                regs.istr.modify(|_, w| w.reset().clear_bit());
 
-                if v.ctr_tx().bit_is_set() {
-                    ep_in_complete |= bit;
+                PollResult::Reset
+            } else if istr.susp().bit_is_set() {
+                regs.istr.modify(|_, w| w.susp().clear_bit());
 
-                    interrupt::free(|cs| {
-                        ep.clear_ctr_tx(cs);
-                    });
+                PollResult::Suspend
+            } else if istr.ctr().bit_is_set() {
+                let mut ep_out = 0;
+                let mut ep_in_complete = 0;
+                let mut ep_setup = 0;
+                let mut bit = 1;
+
+                for ep in &self.endpoints[0..=self.max_endpoint] {
+                    let v = ep.read_reg();
+
+                    if v.ctr_rx().bit_is_set() {
+                        ep_out |= bit;
+
+                        if v.setup().bit_is_set() {
+                            ep_setup |= bit;
+                        }
+                    }
+
+                    if v.ctr_tx().bit_is_set() {
+                        ep_in_complete |= bit;
+
+                        interrupt::free(|cs| {
+                            ep.clear_ctr_tx(cs);
+                        });
+                    }
+
+                    bit <<= 1;
                 }
 
-                bit <<= 1;
+                PollResult::Data { ep_out, ep_in_complete, ep_setup }
+            } else {
+                PollResult::None
             }
-
-            PollResult::Data { ep_out, ep_in_complete, ep_setup }
-        } else {
-            PollResult::None
-        }
+        })
     }
 
     fn write(&self, ep_addr: EndpointAddress, buf: &[u8]) -> Result<usize> {
@@ -306,7 +305,7 @@ impl usb_device::bus::UsbBus for UsbBus {
 
     fn suspend(&self) {
         interrupt::free(|cs| {
-             self.regs.lock(cs).cntr.modify(|_, w| w
+             self.regs.borrow(cs).cntr.modify(|_, w| w
                 .fsusp().set_bit()
                 .lpmode().set_bit());
         });
@@ -314,7 +313,7 @@ impl usb_device::bus::UsbBus for UsbBus {
 
     fn resume(&self) {
         interrupt::free(|cs| {
-            self.regs.lock(cs).cntr.modify(|_, w| w
+            self.regs.borrow(cs).cntr.modify(|_, w| w
                 .fsusp().clear_bit()
                 .lpmode().clear_bit());
         });
@@ -322,7 +321,7 @@ impl usb_device::bus::UsbBus for UsbBus {
 
     fn force_reset(&self) -> Result<()> {
         interrupt::free(|cs| {
-            let regs = self.regs.lock(cs);
+            let regs = self.regs.borrow(cs);
 
             match self.reset {
                 Some(ref reset) => {
@@ -330,13 +329,24 @@ impl usb_device::bus::UsbBus for UsbBus {
                     regs.cntr.modify(|_, w| w.pdwn().set_bit());
 
                     reset.pin.borrow(cs).borrow_mut().set_low();
-                    delay(reset.delay);
+                    //delay(reset.delay);
+                    for _ in 0..(1 << 8) { //FIXME get something that will wait the correct time
+                        asm::nop();
+                    }
 
                     regs.cntr.modify(|_, w| w.pdwn().bit(pdwn));
 
                     Ok(())
                 },
-                None => Err(UsbError::Unsupported),
+                None => {
+                    regs.bcdr.modify(|_, w| w.dppu().clear_bit()); // Disable embedded Pull-up
+//                    delay(100);
+                    for _ in 0..(1 << 10) { //FIXME get something that will wait the correct time
+                        asm::nop();
+                    }
+                    regs.bcdr.modify(|_, w| w.dppu().set_bit()); // Enable embedded Pull-up
+                    Ok(())
+                },
             }
         })
     }

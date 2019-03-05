@@ -1,30 +1,31 @@
 use core::slice;
 use core::mem;
-use bare_metal::CriticalSection;
 use vcell::VolatileCell;
 use cortex_m::interrupt;
-use stm32f1xx_hal::stm32::{USB, usb};
+use cortex_m::interrupt::Mutex;
+use cortex_m::interrupt::CriticalSection;
+extern crate stm32f0xx_hal as hal;
+use hal::stm32::{USB, usb};
 use usb_device::{Result, UsbError};
 use usb_device::endpoint::EndpointType;
-use crate::atomic_mutex::AtomicMutex;
 
-type EndpointBuffer = &'static mut [VolatileCell<u32>];
+type EndpointBuffer = &'static mut [VolatileCell<u16>];
 
 pub const NUM_ENDPOINTS: usize = 8;
 
 #[repr(C)]
 struct BufferDescriptor {
-    pub addr_tx: VolatileCell<usize>,
-    pub count_tx: VolatileCell<usize>,
-    pub addr_rx: VolatileCell<usize>,
-    pub count_rx: VolatileCell<usize>,
+    pub addr_tx: VolatileCell<u16>,
+    pub count_tx: VolatileCell<u16>,
+    pub addr_rx: VolatileCell<u16>,
+    pub count_rx: VolatileCell<u16>,
 }
 
 /// Arbitrates access to the endpoint-specific registers and packet buffer memory.
 #[derive(Default)]
 pub struct Endpoint {
-    out_buf: Option<AtomicMutex<EndpointBuffer>>,
-    in_buf: Option<AtomicMutex<EndpointBuffer>>,
+    out_buf: Option<Mutex<EndpointBuffer>>,
+    in_buf: Option<Mutex<EndpointBuffer>>,
     ep_type: Option<EndpointType>,
     index: u8,
 }
@@ -51,8 +52,8 @@ pub fn calculate_count_rx(mut size: usize) -> Result<(usize, u16)> {
 
 impl Endpoint {
     pub const MEM_START: usize = mem::size_of::<BufferDescriptor>() * NUM_ENDPOINTS;
-    pub const MEM_SIZE: usize = 512;
-    const MEM_ADDR: *mut VolatileCell<u32> = 0x4000_6000 as *mut VolatileCell<u32>;
+    pub const MEM_SIZE: usize = 1024;
+    const MEM_ADDR: *mut VolatileCell<u16> = 0x4000_6000 as *mut VolatileCell<u16>;
 
     pub fn new(index: u8) -> Endpoint {
         Endpoint {
@@ -64,9 +65,9 @@ impl Endpoint {
     }
 
     fn make_buf(addr: usize, size: usize)
-        -> Option<AtomicMutex<&'static mut [VolatileCell<u32>]>>
+        -> Option<Mutex<&'static mut [VolatileCell<u16>]>>
     {
-        Some(AtomicMutex::new(
+        Some(Mutex::new(
             unsafe {
                 slice::from_raw_parts_mut(
                     Self::MEM_ADDR.offset((addr >> 1) as isize),
@@ -91,8 +92,8 @@ impl Endpoint {
         self.out_buf = Self::make_buf(addr, size_and_bits.0);
 
         let descr = self.descr();
-        descr.addr_rx.set(addr);
-        descr.count_rx.set(size_and_bits.1 as usize);
+        descr.addr_rx.set(addr as u16);
+        descr.count_rx.set(size_and_bits.1 as u16);
     }
 
     pub fn is_in_buf_set(&self) -> bool {
@@ -103,7 +104,7 @@ impl Endpoint {
         self.in_buf = Self::make_buf(addr, max_packet_size);
 
         let descr = self.descr();
-        descr.addr_tx.set(addr);
+        descr.addr_tx.set(addr as u16);
         descr.count_tx.set(0);
     }
 
@@ -143,82 +144,70 @@ impl Endpoint {
     }
 
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
-        let guard = self.in_buf.as_ref().unwrap().try_lock();
-
-        let in_buf = match guard {
-            Some(ref b) => b,
-            None => { return Err(UsbError::WouldBlock); }
-        };
-
-        if buf.len() > in_buf.len() << 1 {
-            return Err(UsbError::BufferOverflow);
-        }
-
-        let reg = self.reg();
-
-        match reg.read().stat_tx().bits().into() {
-            EndpointStatus::Valid | EndpointStatus::Disabled => return Err(UsbError::WouldBlock),
-            _ => {},
-        };
-
-        self.write_mem(in_buf, buf);
-        self.descr().count_tx.set(buf.len());
-
         interrupt::free(|cs| {
-            self.set_stat_tx(cs, EndpointStatus::Valid);
-        });
+            let in_buf = self.in_buf.as_ref().unwrap().borrow(cs);
+    
+            if buf.len() > in_buf.len() << 1 {
+                return Err(UsbError::BufferOverflow);
+            }
+    
+            let reg = self.reg();
+    
+            match reg.read().stat_tx().bits().into() {
+                EndpointStatus::Valid | EndpointStatus::Disabled => return Err(UsbError::WouldBlock),
+                _ => {},
+            };
+    
+            self.write_mem(in_buf, buf);
+            self.descr().count_tx.set(buf.len() as u16);
 
-        Ok(buf.len())
+            self.set_stat_tx(cs, EndpointStatus::Valid);
+            Ok(buf.len())
+        })
     }
 
-    fn write_mem(&self, mem: &[VolatileCell<u32>], mut buf: &[u8]) {
+    fn write_mem(&self, mem: &[VolatileCell<u16>], mut buf: &[u8]) {
         let mut addr = 0;
 
         while buf.len() >= 2 {
-            mem[addr].set((buf[0] as u16 | ((buf[1] as u16) << 8)) as u32);
+            mem[addr].set((buf[0] as u16 | ((buf[1] as u16) << 8)));
             addr += 1;
 
             buf = &buf[2..];
         }
 
         if buf.len() > 0 {
-            mem[addr].set(buf[0] as u32);
+            mem[addr].set(buf[0] as u16);
         }
     }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        let guard = self.out_buf.as_ref().unwrap().try_lock();
-
-        let out_buf = match guard {
-            Some(ref b) => b,
-            None => { return Err(UsbError::WouldBlock); }
-        };
-
-        let reg = self.reg();
-        let reg_v = reg.read();
-
-        let status: EndpointStatus = reg_v.stat_rx().bits().into();
-
-        if status == EndpointStatus::Disabled || !reg_v.ctr_rx().bit_is_set() {
-            return Err(UsbError::WouldBlock);
-        }
-
-        let count = self.descr().count_rx.get() & 0x3ff;
-        if count > buf.len() {
-            return Err(UsbError::BufferOverflow);
-        }
-
-        self.read_mem(out_buf, &mut buf[0..count]);
-
         interrupt::free(|cs| {
+            let out_buf = self.out_buf.as_ref().unwrap().borrow(cs);
+
+            let reg = self.reg();
+            let reg_v = reg.read();
+
+            let status: EndpointStatus = reg_v.stat_rx().bits().into();
+
+            if status == EndpointStatus::Disabled || !reg_v.ctr_rx().bit_is_set() {
+                return Err(UsbError::WouldBlock);
+            }
+
+            let count = (self.descr().count_rx.get() & 0x3ff) as usize;
+            if count > buf.len() {
+                return Err(UsbError::BufferOverflow);
+            }
+
+            self.read_mem(out_buf, &mut buf[0..count]);
+
             self.clear_ctr_rx(cs);
             self.set_stat_rx(cs, EndpointStatus::Valid);
-        });
-
-        Ok(count)
+            Ok(count)
+        })
     }
 
-    fn read_mem(&self, mem: &[VolatileCell<u32>], mut buf: &mut [u8]) {
+    fn read_mem(&self, mem: &[VolatileCell<u16>], mut buf: &mut [u8]) {
         let mut addr = 0;
 
         while buf.len() >= 2 {
@@ -248,13 +237,11 @@ impl Endpoint {
     }*/
 
     fn clear_toggle_bits(w: &mut usb::epr::W) -> &mut usb::epr::W {
-        unsafe {
-            w
-                .dtog_rx().clear_bit()
-                .dtog_tx().clear_bit()
-                .stat_rx().bits(0)
-                .stat_tx().bits(0)
-        }
+        w
+            .dtog_rx().clear_bit()
+            .dtog_tx().clear_bit()
+            .stat_rx().disabled()
+            .stat_tx().disabled()
     }
 
     pub fn clear_ctr_rx(&self, _cs: &CriticalSection) {
@@ -266,14 +253,14 @@ impl Endpoint {
     }
 
     pub fn set_stat_rx(&self, _cs: &CriticalSection, status: EndpointStatus) {
-        self.reg().modify(|r, w| unsafe {
+        self.reg().modify(|r, w| {
             Self::clear_toggle_bits(w)
                 .stat_rx().bits(r.stat_rx().bits() ^ (status as u8))
         });
     }
 
     pub fn set_stat_tx(&self, _cs: &CriticalSection, status: EndpointStatus) {
-        self.reg().modify(|r, w| unsafe {
+        self.reg().modify(|r, w| {
             Self::clear_toggle_bits(w)
                 .stat_tx().bits(r.stat_tx().bits() ^ (status as u8))
         });
