@@ -11,9 +11,8 @@ cortex-m = "0.5.8"
 usb-device = { git = "https://github.com/mvirkkunen/usb-device", rev = "e58e30f3b9c9bf4aab00ea039d129b964a3fd2d3" }
 
 [dependencies.stm32f0xx-hal]
-version = "0.13.0"
+version = "0.14.0"
 features = ["stm32f042", "rt"]
-path = "/home/jma/projekte/rust/stm32f0xx-hal"
 
 [dev-dependencies]
 cortex-m-rt = "0.6.7"
