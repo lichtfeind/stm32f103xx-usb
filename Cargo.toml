@@ -8,7 +8,8 @@ authors = ["Matti Virkkunen <mvirkkunen@gmail.com>", "Jonas Martin <lichtfeind@g
 bare-metal = "0.2.4"
 vcell = "0.1.0"
 cortex-m = "0.5.8"
-usb-device = { git = "https://github.com/mvirkkunen/usb-device", rev = "e58e30f3b9c9bf4aab00ea039d129b964a3fd2d3" }
+#usb-device = { git = "https://github.com/mvirkkunen/usb-device", rev = "e58e30f3b9c9bf4aab00ea039d129b964a3fd2d3" }
+usb-device = "0.2.0"
 
 [dependencies.stm32f0xx-hal]
 version = "0.14.0"
