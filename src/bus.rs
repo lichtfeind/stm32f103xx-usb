@@ -1,4 +1,3 @@
-use core::cell::RefCell;
 use core::mem;
 use usb_device::{Result, UsbDirection, UsbError};
 use usb_device::bus::{UsbBusAllocator, PollResult};
@@ -7,16 +6,9 @@ use cortex_m::asm;
 use cortex_m::interrupt;
 use cortex_m::interrupt::Mutex;
 extern crate stm32f0xx_hal as hal;
-use hal::prelude::*;
 use hal::rcc;
-use hal::gpio::{Pin, Output, PushPull};
 use hal::stm32::{USB, RCC, CRS};
 use crate::endpoint::{NUM_ENDPOINTS, Endpoint, EndpointStatus, calculate_count_rx};
-
-struct Reset {
-    delay: u32,
-    pin: Mutex<RefCell<Pin<Output<PushPull>>>>,
-}
 
 /// USB peripheral driver for STM32F103 microcontrollers.
 pub struct UsbBus {
@@ -24,11 +16,10 @@ pub struct UsbBus {
     endpoints: [Endpoint; NUM_ENDPOINTS],
     next_ep_mem: usize,
     max_endpoint: usize,
-    reset: Option<Reset>,
 }
 
 impl UsbBus {
-    fn new(regs: USB, rcc: &mut rcc::Rcc, reset: Option<Reset>) -> UsbBusAllocator<Self> {
+    fn new(regs: USB, rcc: &mut rcc::Rcc) -> UsbBusAllocator<Self> {
         // TODO: apb1.enr is not public, figure out how this should really interact with the HAL
         // crate
         let _ = rcc;
@@ -65,7 +56,6 @@ impl UsbBus {
 
                 endpoints
             },
-            reset,
         };
 
         UsbBusAllocator::new(bus)
@@ -73,23 +63,7 @@ impl UsbBus {
 
     /// Constructs a new USB peripheral driver.
     pub fn usb(regs: USB, apb1: &mut rcc::Rcc) -> UsbBusAllocator<Self> {
-        UsbBus::new(regs, apb1, None)
-    }
-
-    /// Constructs a new USB peripheral driver with the "reset" method enabled.
-    pub fn usb_with_reset(
-        regs: USB,
-        apb1: &mut rcc::Rcc,
-        clocks: &rcc::Clocks,
-        reset_pin: Pin<Output<PushPull>>) -> UsbBusAllocator<Self>
-    {
-        UsbBus::new(
-            regs,
-            apb1,
-            Some(Reset {
-                delay: clocks.sysclk().0,
-                pin: Mutex::new(RefCell::new(reset_pin)),
-            }))
+        UsbBus::new(regs, apb1)
     }
 
     fn alloc_ep_mem(next_ep_mem: &mut usize, size: usize) -> Result<usize> {
@@ -342,31 +316,13 @@ impl usb_device::bus::UsbBus for UsbBus {
         interrupt::free(|cs| {
             let regs = self.regs.borrow(cs);
 
-            match self.reset {
-                Some(ref reset) => {
-                    let pdwn = regs.cntr.read().pdwn().bit_is_set();
-                    regs.cntr.modify(|_, w| w.pdwn().set_bit());
-
-                    reset.pin.borrow(cs).borrow_mut().set_low();
-                    //delay(reset.delay);
-                    for _ in 0..(1 << 8) { //FIXME get something that will wait the correct time
-                        asm::nop();
-                    }
-
-                    regs.cntr.modify(|_, w| w.pdwn().bit(pdwn));
-
-                    Ok(())
-                },
-                None => {
-                    regs.bcdr.modify(|_, w| w.dppu().clear_bit()); // Disable embedded Pull-up
-//                    delay(100);
-                    for _ in 0..(1 << 10) { //FIXME get something that will wait the correct time
-                        asm::nop();
-                    }
-                    regs.bcdr.modify(|_, w| w.dppu().set_bit()); // Enable embedded Pull-up
-                    Ok(())
-                },
+            regs.bcdr.modify(|_, w| w.dppu().clear_bit()); // Disable embedded Pull-up
+//            delay(100);
+            for _ in 0..(1 << 10) { //FIXME get something that will wait the correct time
+                asm::nop();
             }
+            regs.bcdr.modify(|_, w| w.dppu().set_bit()); // Enable embedded Pull-up
+            Ok(())
         })
     }
 }

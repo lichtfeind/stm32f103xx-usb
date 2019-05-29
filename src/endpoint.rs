@@ -170,7 +170,7 @@ impl Endpoint {
         let mut addr = 0;
 
         while buf.len() >= 2 {
-            mem[addr].set((buf[0] as u16 | ((buf[1] as u16) << 8)));
+            mem[addr].set(buf[0] as u16 | ((buf[1] as u16) << 8));
             addr += 1;
 
             buf = &buf[2..];
