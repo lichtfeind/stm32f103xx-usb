@@ -217,6 +217,9 @@ impl usb_device::bus::UsbBus for UsbBus {
             if istr.wkup().bit_is_set() {
                 regs.istr.modify(|_, w| w.wkup().clear_bit());
 
+                self.regs.borrow(cs).cntr.modify(|_, w| w
+                    .fsusp().clear_bit());
+
                 let fnr = regs.fnr.read();
                 //let bits = (fnr.rxdp().bit_is_set() as u8) << 1 | (fnr.rxdm().bit_is_set() as u8);
 
@@ -226,6 +229,8 @@ impl usb_device::bus::UsbBus for UsbBus {
                     },
                     _ => {
                         // Spurious wakeup event caused by noise
+                        self.regs.borrow(cs).cntr.modify(|_, w| w
+                            .fsusp().set_bit());
                         PollResult::Suspend
                     }
                 }
