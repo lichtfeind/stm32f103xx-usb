@@ -9,13 +9,13 @@ extern crate panic_semihosting;
 mod cdc_acm;
 
 use rtfm::app;
-use stm32f1xx_hal::prelude::*;
+use stm32f0xx_hal::prelude::*;
 
 use usb_device::prelude::*;
-use stm32f103xx_usb::UsbBus;
+use stm32f042xx_usb::UsbBus;
 use usb_device::bus;
 
-#[app(device = stm32f1xx_hal::stm32)]
+#[app(device = stm32f0xx_hal::stm32)]
 const APP: () = {
 
     static mut USB_DEV: UsbDevice<'static, UsbBus> = ();
@@ -25,22 +25,11 @@ const APP: () = {
     fn init() {
         static mut USB_BUS: Option<bus::UsbBusAllocator<UsbBus>> = None;
 
-        let mut flash = device.FLASH.constrain();
-        let mut rcc = device.RCC.constrain();
+        let mut rcc = device.RCC.configure().sysclk(48.mhz()).freeze(&mut device.FLASH);
 
-        let clocks = rcc.cfgr
-            .use_hse(8.mhz())
-            .sysclk(48.mhz())
-            .pclk1(24.mhz())
-            .freeze(&mut flash.acr);
 
-        assert!(clocks.usbclk_valid());
-
-        let mut gpioa = device.GPIOA.split(&mut rcc.apb2);
-
-        *USB_BUS = Some(UsbBus::usb_with_reset(
-            device.USB, &mut rcc.apb1,
-            &clocks, &mut gpioa.crh, gpioa.pa12));
+        *USB_BUS = Some(UsbBus::usb(
+            device.USB, &mut rcc));
 
         let serial = cdc_acm::SerialPort::new(USB_BUS.as_ref().unwrap());
 
@@ -60,12 +49,7 @@ const APP: () = {
     }
 
     #[interrupt(resources = [USB_DEV, SERIAL])]
-    fn USB_HP_CAN_TX() {
-        usb_poll(&mut resources.USB_DEV, &mut resources.SERIAL);
-    }
-
-    #[interrupt(resources = [USB_DEV, SERIAL])]
-    fn USB_LP_CAN_RX0() {
+    fn USB() {
         usb_poll(&mut resources.USB_DEV, &mut resources.SERIAL);
     }
 };

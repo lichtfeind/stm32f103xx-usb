@@ -7,11 +7,11 @@ extern crate panic_semihosting;
 
 use cortex_m::asm::wfi;
 use cortex_m_rt::entry;
-use stm32f1xx_hal::{prelude::*, stm32};
-use stm32f1xx_hal::stm32::{interrupt, Interrupt};
+use stm32f0xx_hal::{prelude::*, stm32};
+use stm32f0xx_hal::stm32::{interrupt, Interrupt};
 
 use usb_device::{prelude::*, bus::UsbBusAllocator};
-use stm32f103xx_usb::UsbBus;
+use stm32f042xx_usb::UsbBus;
 
 mod cdc_acm;
 
@@ -22,25 +22,13 @@ static mut USB_DEVICE: Option<UsbDevice<UsbBus>> = None;
 #[entry]
 fn main() -> ! {
     let p = cortex_m::Peripherals::take().unwrap();
-    let dp = stm32::Peripherals::take().unwrap();
+    let mut dp = stm32::Peripherals::take().unwrap();
 
-    let mut flash = dp.FLASH.constrain();
-    let mut rcc = dp.RCC.constrain();
-
-    let clocks = rcc.cfgr
-        .use_hse(8.mhz())
-        .sysclk(48.mhz())
-        .pclk1(24.mhz())
-        .freeze(&mut flash.acr);
-
-    assert!(clocks.usbclk_valid());
-
-    let mut gpioa = dp.GPIOA.split(&mut rcc.apb2);
+    let mut rcc = dp.RCC.configure().sysclk(48.mhz()).freeze(&mut dp.FLASH);
 
     // Unsafe to allow access to static variables
     unsafe {
-        let bus = UsbBus::usb_with_reset(dp.USB,
-            &mut rcc.apb1, &clocks, &mut gpioa.crh, gpioa.pa12);
+        let bus = UsbBus::usb(dp.USB, &mut rcc);
 
         USB_BUS = Some(bus);
 
@@ -62,19 +50,13 @@ fn main() -> ! {
 
     let mut nvic = p.NVIC;
 
-    nvic.enable(Interrupt::USB_HP_CAN_TX);
-    nvic.enable(Interrupt::USB_LP_CAN_RX0);
+    nvic.enable(Interrupt::USB);
 
     loop { wfi(); }
 }
 
 #[interrupt]
-fn USB_HP_CAN_TX() {
-    usb_interrupt();
-}
-
-#[interrupt]
-fn USB_LP_CAN_RX0() {
+fn USB() {
     usb_interrupt();
 }
 
