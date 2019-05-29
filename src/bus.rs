@@ -10,7 +10,7 @@ extern crate stm32f0xx_hal as hal;
 use hal::prelude::*;
 use hal::rcc;
 use hal::gpio::{Pin, Output, PushPull};
-use hal::stm32::{USB, RCC};
+use hal::stm32::{USB, RCC, CRS};
 use crate::endpoint::{NUM_ENDPOINTS, Endpoint, EndpointStatus, calculate_count_rx};
 
 struct Reset {
@@ -34,8 +34,22 @@ impl UsbBus {
         let _ = rcc;
         interrupt::free(|_| {
             let rcc = unsafe { (&*RCC::ptr()) };
-            rcc.apb1enr.modify(|_, w| w.usben().set_bit());
-            rcc.cfgr3.modify(|_, w| w.usbsw().clear_bit());
+            rcc.cr2.modify(|_,w| w.hsi48on().set_bit());
+            // Wait for internel 48MHz osci to get stable
+            while rcc.cr2.read().hsi48rdy().bit_is_clear() {};
+
+            rcc.apb1enr.modify(|_, w| w
+                               .usben().set_bit() // enable clock for USB interface
+                               .crsen().set_bit() // enable clock for Clock Recovery System
+                               );
+
+            rcc.cfgr3.modify(|_, w| w.usbsw().clear_bit()); // select internel 48Mhz osci for USB
+
+            // TODO pass crs register bank
+            let crs = unsafe { (&*CRS::ptr()) };
+
+            crs.cr.modify(|_,w| w.autotrimen().set_bit()); // enable trim for internel 48MHz osci
+            crs.cr.modify(|_,w| w.cen().set_bit()); // enable trim for internel 48MHz osci
         });
 
         let bus = UsbBus {
